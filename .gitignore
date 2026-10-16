@@ -1,4 +1,7 @@
 models/*.dat
+models/*.part
+models/*.bz2
 __pycache__/
 SPEC_person2_alert_ui.md
 .pytest_cache/
+.venv/
