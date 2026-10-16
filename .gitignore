@@ -1,2 +1,4 @@
 models/*.dat
 __pycache__/
+SPEC_person2_alert_ui.md
+.pytest_cache/

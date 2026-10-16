@@ -1,3 +1,8 @@
 dlib-bin>=19.24
 opencv-python>=4.8
 numpy
+pytest
+# optional: alternative landmark model (--model mediapipe); needs Python <= 3.12
+# mediapipe>=0.10,<0.10.15
+# optional: mp3 alert sound via Config.sound_file / --sound-file
+# pygame
