@@ -1,4 +1,10 @@
-"""Lõi nhận diện (Người 1): MediaPipe Face Mesh -> EAR, MAR, pitch + hiệu chỉnh theo từng người.
+"""Lõi nhận diện (Người 1): dlib HOG + 68 landmark -> EAR, MAR, pitch + hiệu chỉnh theo từng người.
+
+Pipeline tham khảo từ github.com/Gagandeep-2003/driver-drowsiness-detection-system (blinkDetect.py):
+resize -> xám -> cân bằng histogram -> dlib HOG face detector (trên ảnh thu nhỏ) -> shape predictor 68 điểm.
+Khác bản gốc: ngưỡng EAR tự hiệu chỉnh thay vì cố định 0.27, thêm MAR và góc cúi đầu.
+
+Cần file models/shape_predictor_68_face_landmarks.dat (chạy: python download_model.py).
 
 Dùng trong code khác:
     core = FaceCore()
@@ -8,21 +14,24 @@ Chạy thử độc lập:  python face_core.py   (q để thoát, c để hiệ
 """
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from statistics import median
 
 import cv2
-import mediapipe as mp
+import dlib
 import numpy as np
 
-# Chỉ số landmark Face Mesh, thứ tự p1..p6 theo công thức EAR (Soukupová & Čech, 2016)
-RIGHT_EYE = [33, 160, 158, 133, 153, 144]
-LEFT_EYE = [362, 385, 387, 263, 373, 380]
-# Miệng: 2 khóe + 3 cặp môi trong (trên, dưới)
-MOUTH_CORNERS = (61, 291)
-MOUTH_PAIRS = [(81, 178), (13, 14), (311, 402)]
+PREDICTOR_PATH = Path(__file__).parent / "models" / "shape_predictor_68_face_landmarks.dat"
+
+# Chỉ số landmark dlib 68 điểm, thứ tự p1..p6 theo công thức EAR (Soukupová & Čech, 2016)
+RIGHT_EYE = [36, 37, 38, 39, 40, 41]
+LEFT_EYE = [42, 43, 44, 45, 46, 47]
+# Miệng: 2 khóe môi trong + 3 cặp môi trong (trên, dưới)
+MOUTH_CORNERS = (60, 64)
+MOUTH_PAIRS = [(61, 67), (62, 66), (63, 65)]
 
 # Điểm dùng cho solvePnP và mô hình 3D mặt chung (đơn vị tùy ý)
-POSE_IDS = [1, 152, 33, 263, 61, 291]
+POSE_IDS = [30, 8, 36, 45, 48, 54]
 POSE_MODEL = np.array([
     (0.0, 0.0, 0.0),          # mũi
     (0.0, -330.0, -65.0),     # cằm
@@ -32,6 +41,8 @@ POSE_MODEL = np.array([
     (150.0, -150.0, -125.0),
 ])
 
+FRAME_HEIGHT = 460             # như bản gốc: resize trước khi xử lý
+FACE_DOWNSAMPLE_RATIO = 1.5    # detect mặt trên ảnh nhỏ hơn cho nhanh
 CALIB_SECONDS = 4.0
 EAR_RATIO = 0.72  # ngưỡng nhắm = 72% EAR khi mở mắt
 
@@ -43,7 +54,7 @@ class FaceMetrics:
     pitch: float | None        # độ, so với tư thế lúc hiệu chỉnh (âm = cúi xuống)
     eyes_closed: bool | None   # None khi đang hiệu chỉnh
     calibrated: bool
-    landmarks: np.ndarray      # (468+, 2) tọa độ pixel
+    landmarks: np.ndarray      # (68, 2) tọa độ pixel trên frame gốc
 
 
 def _dist(a, b):
@@ -79,10 +90,11 @@ def head_pitch(pts, w, h):
 
 
 class FaceCore:
-    def __init__(self, calib_seconds=CALIB_SECONDS, ear_ratio=EAR_RATIO):
-        self.mesh = mp.solutions.face_mesh.FaceMesh(
-            max_num_faces=1, refine_landmarks=True,
-            min_detection_confidence=0.5, min_tracking_confidence=0.5)
+    def __init__(self, calib_seconds=CALIB_SECONDS, ear_ratio=EAR_RATIO, predictor_path=PREDICTOR_PATH):
+        if not Path(predictor_path).exists():
+            raise FileNotFoundError(f"Thiếu {predictor_path}. Chạy: python download_model.py")
+        self.detector = dlib.get_frontal_face_detector()
+        self.predictor = dlib.shape_predictor(str(predictor_path))
         self.calib_seconds = calib_seconds
         self.ear_ratio = ear_ratio
         self.recalibrate()
@@ -118,13 +130,29 @@ class FaceCore:
             if self._pitch_samples:
                 self.pitch_baseline = median(self._pitch_samples)
 
+    def _landmarks(self, frame_bgr):
+        """Trả về (68, 2) tọa độ trên frame gốc, hoặc None."""
+        h, w = frame_bgr.shape[:2]
+        scale = FRAME_HEIGHT / h
+        small = cv2.resize(frame_bgr, (int(w * scale), FRAME_HEIGHT))
+        gray = cv2.equalizeHist(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY))  # đỡ thiếu sáng
+
+        tiny = cv2.resize(gray, None, fx=1 / FACE_DOWNSAMPLE_RATIO, fy=1 / FACE_DOWNSAMPLE_RATIO)
+        faces = self.detector(tiny, 0)
+        if not faces:
+            return None
+        f = max(faces, key=lambda r: r.area())  # mặt lớn nhất = tài xế
+        r = FACE_DOWNSAMPLE_RATIO
+        rect = dlib.rectangle(int(f.left() * r), int(f.top() * r), int(f.right() * r), int(f.bottom() * r))
+        shape = self.predictor(gray, rect)
+        pts = np.array([(p.x, p.y) for p in shape.parts()], dtype=np.float64)
+        return pts / scale
+
     def process(self, frame_bgr):
         h, w = frame_bgr.shape[:2]
-        res = self.mesh.process(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-        if not res.multi_face_landmarks:
+        pts = self._landmarks(frame_bgr)
+        if pts is None:
             return None
-        lm = res.multi_face_landmarks[0].landmark
-        pts = np.array([(p.x * w, p.y * h) for p in lm])
 
         ear = (eye_aspect_ratio(pts, LEFT_EYE) + eye_aspect_ratio(pts, RIGHT_EYE)) / 2.0
         mar = mouth_aspect_ratio(pts)
